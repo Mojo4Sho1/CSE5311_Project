@@ -76,11 +76,9 @@ sorting-bench/
 ├─ notebooks/
 │  ├─ 01_random_scaling.ipynb
 │  └─ 02_sensitivity.ipynb
-├─ tests/
-│  ├─ test_correctness.py
-│  └─ test_stability.py
-└─ slides/
-   └─ talk-outline.md
+└─ tests/
+   ├─ test_correctness.py
+   └─ test_stability.py
 ```
 
 ---
