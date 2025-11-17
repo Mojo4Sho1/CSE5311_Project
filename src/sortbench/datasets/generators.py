@@ -2,24 +2,40 @@
 Dataset generators for sorting benchmarks.
 
 Currently implemented:
-- dist == "random": integer arrays drawn uniformly from an inclusive range.
+- dist == "random":
+    Integer arrays drawn uniformly from an inclusive range.
+
+- dist == "nearly_sorted":
+    Start from strictly increasing [0, 1, ..., n-1] then perform
+    ceil(swap_frac * n) random index swaps using the provided RNG.
+
+- dist == "few_uniques":
+    Choose up to k distinct integer values (uniform over an inclusive range),
+    then fill the array by sampling indices in [0, k) uniformly.
 
 Public API (stable):
     make_dataset(n: int, spec: dict, rng: numpy.random.Generator) -> list[int]
 
 Conventions:
-- The integer range in `spec["params"]["range"]` is **inclusive** on both ends.
+- For "random", the integer range in params["range"] is **inclusive** on both ends.
+- For "nearly_sorted":
+    * No explicit value range; starts from [0..n-1] (unique, strictly increasing),
+      then performs controlled swaps to degrade sortedness.
+- For "few_uniques":
+    * Optional inclusive "range" (defaults to [0, 4294967295]); pick at most
+      min(k, n, span) distinct values from that range, then populate length-n
+      array by sampling indices into that value list.
 - Returns a Python `list[int]` (algorithms stay NumPy-agnostic).
 - The caller supplies the RNG (for reproducibility across runs).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-SUPPORTED_DISTS = {"random"}
+SUPPORTED_DISTS = {"random", "nearly_sorted", "few_uniques"}
 __all__ = ["SUPPORTED_DISTS", "make_dataset"]
 
 
@@ -32,13 +48,29 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
     n : int
         Number of elements to generate. Must be >= 0.
     spec : dict
-        Distribution specification. For the random case:
+        Distribution specification.
+
+        Random:
             {
                 "dist": "random",
+                "params": { "range": [min_int, max_int] }  # inclusive
+            }
+
+        Nearly-sorted:
+            {
+                "dist": "nearly_sorted",
+                "params": { "swap_frac": 0.05 }            # in [0.0, 1.0]
+            }
+
+        Few-uniques:
+            {
+                "dist": "few_uniques",
                 "params": {
-                    "range": [min_int, max_int]  # inclusive bounds
+                    "k": 100,                              # desired #unique values (>=1)
+                    "range": [min_int, max_int]            # optional; inclusive; default [0, 4294967295]
                 }
             }
+
     rng : numpy.random.Generator
         Random number generator owned by the caller (seeded upstream).
 
@@ -61,15 +93,69 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
     if dist not in SUPPORTED_DISTS:
         raise ValueError(f"Unsupported dataset dist: {dist!r}. Supported: {sorted(SUPPORTED_DISTS)}")
 
+    params = spec.get("params", {})
+
     if dist == "random":
-        params = spec.get("params", {})
         lo, hi = _parse_inclusive_range(params)
-        # Note: np.random.Generator.integers uses half-open [low, high) by default.
-        # We add +1 to make the upper bound inclusive.
         if n == 0:
             return []
+        # np.random.Generator.integers is half-open [low, high) by default.
+        # Add +1 to make the upper bound inclusive.
         arr = rng.integers(lo, hi + 1, size=n, dtype=np.int64)  # type: ignore[arg-type]
         return arr.tolist()
+
+    if dist == "nearly_sorted":
+        swap_frac = _parse_swap_frac(params)
+        if n == 0:
+            return []
+        # Start from already-sorted unique integers [0..n-1]
+        arr = list(range(n))
+        # Number of swaps to apply (ceil so small nonzero frac makes at least one swap)
+        num_swaps = int(np.ceil(swap_frac * n))
+        if num_swaps <= 0:
+            return arr
+        # Draw 2 * num_swaps indices in [0, n) and swap in pairs
+        idxs = rng.integers(0, n, size=2 * num_swaps)
+        for k in range(num_swaps):
+            i = int(idxs[2 * k])
+            j = int(idxs[2 * k + 1])
+            if i != j:
+                arr[i], arr[j] = arr[j], arr[i]
+            # If i == j, the swap is a no-op; effective swaps may be fewer than requested.
+        return arr
+
+    if dist == "few_uniques":
+        k = _parse_k(params)
+        lo, hi = _parse_optional_inclusive_range(params, default=(0, 4294967295))
+        if n == 0:
+            return []
+        span = hi - lo + 1
+        if span <= 0:
+            raise ValueError(f"few_uniques.params.range invalid (empty span): [{lo}, {hi}]")
+
+        # We cannot use more unique values than available in the span or positions in the array.
+        actual_k = int(min(k, n, span))
+
+        # Sample `actual_k` unique integers in [lo, hi] using the provided RNG.
+        # We avoid Python's random.sample (different RNG) to keep determinism tied to `rng`.
+        # Strategy: draw until we collect `actual_k` unique values; for typical few-uniques, k << span.
+        chosen_vals_list: List[int] = []
+        chosen_set = set()
+        while len(chosen_vals_list) < actual_k:
+            # Draw a small batch to reduce RNG calls in Python loop
+            need = actual_k - len(chosen_vals_list)
+            batch = rng.integers(lo, hi + 1, size=need * 2)  # oversample to reduce collisions
+            for v in map(int, batch):
+                if v not in chosen_set:
+                    chosen_set.add(v)
+                    chosen_vals_list.append(v)
+                    if len(chosen_vals_list) == actual_k:
+                        break
+
+        # Now fill the array by sampling indices into [0, actual_k)
+        idxs = rng.integers(0, actual_k, size=n)
+        out = [chosen_vals_list[int(t)] for t in idxs]
+        return out
 
     # Should be unreachable because of the check above; keep explicit for clarity.
     raise ValueError(f"Unhandled dataset dist: {dist!r}")
@@ -86,7 +172,7 @@ def _validate_n(n: int) -> None:
 
 def _parse_inclusive_range(params: Dict[str, Any]) -> Tuple[int, int]:
     """
-    Validate and parse the inclusive integer range from params.
+    Validate and parse the inclusive integer range from params (REQUIRED).
 
     Expected:
         params["range"] == [min_int, max_int]  (both inclusive)
@@ -99,10 +185,7 @@ def _parse_inclusive_range(params: Dict[str, Any]) -> Tuple[int, int]:
         raise ValueError('random.params.range must be provided as [min, max] (inclusive)')
 
     rng_spec = params["range"]
-    if (
-        not isinstance(rng_spec, (list, tuple))
-        or len(rng_spec) != 2
-    ):
+    if not isinstance(rng_spec, (list, tuple)) or len(rng_spec) != 2:
         raise ValueError("random.params.range must be a 2-element list/tuple [min, max]")
 
     lo_raw, hi_raw = rng_spec[0], rng_spec[1]
@@ -114,6 +197,53 @@ def _parse_inclusive_range(params: Dict[str, Any]) -> Tuple[int, int]:
         raise ValueError(f"random.params.range invalid: min > max ({lo} > {hi})")
 
     return lo, hi
+
+
+def _parse_optional_inclusive_range(params: Dict[str, Any], default: Tuple[int, int]) -> Tuple[int, int]:
+    """
+    Parse an optional inclusive integer range from params.
+    If not present, return `default`.
+    """
+    if "range" not in params:
+        return default
+    spec = params["range"]
+    if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+        raise ValueError("params.range must be a 2-element list/tuple [min, max]")
+    lo_raw, hi_raw = spec
+    if not _is_int_like(lo_raw) or not _is_int_like(hi_raw):
+        raise ValueError("params.range values must be integers")
+    lo, hi = int(lo_raw), int(hi_raw)
+    if lo > hi:
+        raise ValueError(f"params.range invalid: min > max ({lo} > {hi})")
+    return lo, hi
+
+
+def _parse_swap_frac(params: Dict[str, Any]) -> float:
+    """
+    Parse and validate swap_frac in [0.0, 1.0] for nearly_sorted.
+    Default to 0.05 if not provided.
+    """
+    val = params.get("swap_frac", 0.05)
+    try:
+        x = float(val)
+    except Exception as e:
+        raise ValueError(f"nearly_sorted.params.swap_frac must be a float in [0.0, 1.0]; got {val!r}") from e
+    if not (0.0 <= x <= 1.0):
+        raise ValueError(f"nearly_sorted.params.swap_frac must be in [0.0, 1.0]; got {x}")
+    return x
+
+
+def _parse_k(params: Dict[str, Any]) -> int:
+    """
+    Parse and validate k (desired #unique values) for few_uniques.
+    Must be an integer >= 1.
+    """
+    if "k" not in params:
+        raise ValueError("few_uniques.params.k must be provided (int >= 1)")
+    k = params["k"]
+    if not isinstance(k, int) or k < 1:
+        raise ValueError(f"few_uniques.params.k must be an integer >= 1; got {k!r}")
+    return k
 
 
 def _is_int_like(x: Any) -> bool:
