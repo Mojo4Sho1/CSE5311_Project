@@ -13,6 +13,13 @@ Currently implemented:
     Choose up to k distinct integer values (uniform over an inclusive range),
     then fill the array by sampling indices in [0, k) uniformly.
 
+- dist == "small_range":
+    Like "random" but intended for small value ranges (e.g., bytes).
+    By default draws uniformly from [0, 255] inclusive; can be configured.
+
+- dist == "reversed":
+    Deterministic reversed order: [n-1, n-2, ..., 0].
+
 Public API (stable):
     make_dataset(n: int, spec: dict, rng: numpy.random.Generator) -> list[int]
 
@@ -25,8 +32,15 @@ Conventions:
     * Optional inclusive "range" (defaults to [0, 4294967295]); pick at most
       min(k, n, span) distinct values from that range, then populate length-n
       array by sampling indices into that value list.
+- For "small_range":
+    * Intended for small integer domains (e.g., bytes). By default uses [0, 255]
+      inclusive. You can override via:
+        - params["max_val"] (and optional params["min_val"]), or
+        - params["range"] == [min_int, max_int] (inclusive), like "random".
+- For "reversed":
+    * Ignores params and RNG; returns [n-1, ..., 0] deterministically.
 - Returns a Python `list[int]` (algorithms stay NumPy-agnostic).
-- The caller supplies the RNG (for reproducibility across runs).
+- The caller supplies the RNG (for reproducibility across runs where applicable).
 """
 
 from __future__ import annotations
@@ -35,7 +49,13 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-SUPPORTED_DISTS = {"random", "nearly_sorted", "few_uniques"}
+SUPPORTED_DISTS = {
+    "random",
+    "nearly_sorted",
+    "few_uniques",
+    "small_range",
+    "reversed",
+}
 __all__ = ["SUPPORTED_DISTS", "make_dataset"]
 
 
@@ -71,8 +91,26 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
                 }
             }
 
+        Small-range:
+            {
+                "dist": "small_range",
+                "params": {
+                    "max_val": 255,                        # optional; default 255
+                    "min_val": 0                           # optional; default 0
+                    # OR, alternatively:
+                    # "range": [min_int, max_int]          # inclusive, like "random"
+                }
+            }
+
+        Reversed:
+            {
+                "dist": "reversed",
+                "params": {}                               # params unused
+            }
+
     rng : numpy.random.Generator
         Random number generator owned by the caller (seeded upstream).
+        Note: for deterministic distributions like "reversed", `rng` is unused.
 
     Returns
     -------
@@ -91,7 +129,9 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
 
     dist = spec.get("dist", None)
     if dist not in SUPPORTED_DISTS:
-        raise ValueError(f"Unsupported dataset dist: {dist!r}. Supported: {sorted(SUPPORTED_DISTS)}")
+        raise ValueError(
+            f"Unsupported dataset dist: {dist!r}. Supported: {sorted(SUPPORTED_DISTS)}"
+        )
 
     params = spec.get("params", {})
 
@@ -131,7 +171,9 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
             return []
         span = hi - lo + 1
         if span <= 0:
-            raise ValueError(f"few_uniques.params.range invalid (empty span): [{lo}, {hi}]")
+            raise ValueError(
+                f"few_uniques.params.range invalid (empty span): [{lo}, {hi}]"
+            )
 
         # We cannot use more unique values than available in the span or positions in the array.
         actual_k = int(min(k, n, span))
@@ -157,11 +199,27 @@ def make_dataset(n: int, spec: Dict[str, Any], rng: np.random.Generator) -> List
         out = [chosen_vals_list[int(t)] for t in idxs]
         return out
 
+    if dist == "small_range":
+        lo, hi = _parse_small_range(params)
+        if n == 0:
+            return []
+        if lo > hi:
+            raise ValueError(f"small_range invalid: min > max ({lo} > {hi})")
+        arr = rng.integers(lo, hi + 1, size=n, dtype=np.int64)  # type: ignore[arg-type]
+        return arr.tolist()
+
+    if dist == "reversed":
+        # Deterministic reversed order [n-1, ..., 0]; `rng` is unused.
+        if n == 0:
+            return []
+        return list(range(n - 1, -1, -1))
+
     # Should be unreachable because of the check above; keep explicit for clarity.
     raise ValueError(f"Unhandled dataset dist: {dist!r}")
 
 
 # ------------------------- helpers ------------------------- #
+
 
 def _validate_n(n: int) -> None:
     if not isinstance(n, int):
@@ -182,7 +240,9 @@ def _parse_inclusive_range(params: Dict[str, Any]) -> Tuple[int, int]:
     (lo, hi) : tuple[int, int]
     """
     if "range" not in params:
-        raise ValueError('random.params.range must be provided as [min, max] (inclusive)')
+        raise ValueError(
+            "random.params.range must be provided as [min, max] (inclusive)"
+        )
 
     rng_spec = params["range"]
     if not isinstance(rng_spec, (list, tuple)) or len(rng_spec) != 2:
@@ -199,7 +259,9 @@ def _parse_inclusive_range(params: Dict[str, Any]) -> Tuple[int, int]:
     return lo, hi
 
 
-def _parse_optional_inclusive_range(params: Dict[str, Any], default: Tuple[int, int]) -> Tuple[int, int]:
+def _parse_optional_inclusive_range(
+    params: Dict[str, Any], default: Tuple[int, int]
+) -> Tuple[int, int]:
     """
     Parse an optional inclusive integer range from params.
     If not present, return `default`.
@@ -227,9 +289,13 @@ def _parse_swap_frac(params: Dict[str, Any]) -> float:
     try:
         x = float(val)
     except Exception as e:
-        raise ValueError(f"nearly_sorted.params.swap_frac must be a float in [0.0, 1.0]; got {val!r}") from e
+        raise ValueError(
+            f"nearly_sorted.params.swap_frac must be a float in [0.0, 1.0]; got {val!r}"
+        ) from e
     if not (0.0 <= x <= 1.0):
-        raise ValueError(f"nearly_sorted.params.swap_frac must be in [0.0, 1.0]; got {x}")
+        raise ValueError(
+            f"nearly_sorted.params.swap_frac must be in [0.0, 1.0]; got {x}"
+        )
     return x
 
 
@@ -244,6 +310,39 @@ def _parse_k(params: Dict[str, Any]) -> int:
     if not isinstance(k, int) or k < 1:
         raise ValueError(f"few_uniques.params.k must be an integer >= 1; got {k!r}")
     return k
+
+
+def _parse_small_range(params: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    Parse the inclusive integer range for the "small_range" distribution.
+
+    Supports two equivalent forms:
+
+    1) Explicit range (like "random"):
+        params["range"] == [min_int, max_int]
+
+    2) Named bounds (more semantic for small domains):
+        params["min_val"] (optional, default 0)
+        params["max_val"] (optional, default 255)
+
+    Returns
+    -------
+    (lo, hi) : tuple[int, int]
+        Inclusive bounds for the small-range distribution.
+    """
+    # If a full "range" is provided, respect it (including any custom defaults).
+    if "range" in params:
+        return _parse_optional_inclusive_range(params, default=(0, 255))
+
+    # Otherwise fall back to min_val / max_val with sensible defaults.
+    min_raw = params.get("min_val", 0)
+    max_raw = params.get("max_val", 255)
+
+    if not _is_int_like(min_raw) or not _is_int_like(max_raw):
+        raise ValueError("small_range params.min_val/max_val must be integers")
+
+    lo, hi = int(min_raw), int(max_raw)
+    return lo, hi
 
 
 def _is_int_like(x: Any) -> bool:
